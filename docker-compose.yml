@@ -1,0 +1,306 @@
+version: '3.8'
+
+services:
+  # ==========================================
+  # BANCO DE DADOS - PostgreSQL
+  # ==========================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: turnaround_postgres
+    environment:
+      POSTGRES_USER: turnaround_user
+      POSTGRES_PASSWORD: turnaround_secure_pwd_123
+      POSTGRES_DB: turnaround_360
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=pt_BR.UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-database.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - '5432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U turnaround_user -d turnaround_360']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - turnaround_network
+    restart: unless-stopped
+
+  # ==========================================
+  # CACHE - Redis
+  # ==========================================
+  redis:
+    image: redis:7-alpine
+    container_name: turnaround_redis
+    command: redis-server --appendonly yes
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - turnaround_network
+    restart: unless-stopped
+
+  # ==========================================
+  # BUSCA - Elasticsearch
+  # ==========================================
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.5.0
+    container_name: turnaround_elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - '9200:9200'
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: curl -s http://localhost:9200 >/dev/null || exit 1
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    networks:
+      - turnaround_network
+    restart: unless-stopped
+
+  # ==========================================
+  # VISUALIZAÇÃO ELASTICSEARCH - Kibana
+  # ==========================================
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.5.0
+    container_name: turnaround_kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=elastic
+      - ELASTICSEARCH_PASSWORD=
+    ports:
+      - '5601:5601'
+    depends_on:
+      - elasticsearch
+    healthcheck:
+      test: curl -s http://localhost:5601/api/status >/dev/null || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - turnaround_network
+    restart: unless-stopped
+
+  # ==========================================
+  # MESSAGE QUEUE - RabbitMQ
+  # ==========================================
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: turnaround_rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: turnaround_user
+      RABBITMQ_DEFAULT_PASS: turnaround_rabbit_pwd
+      RABBITMQ_DEFAULT_VHOST: /
+    ports:
+      - '5672:5672'
+      - '15672:15672'
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - turnaround_network
+    restart: unless-stopped
+
+  # ==========================================
+  # BACKEND API - Node.js + Express
+  # ==========================================
+  backend:
+    image: turnaround-backend:latest
+    container_name: turnaround_backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      # Database
+      DATABASE_URL: postgresql://turnaround_user:turnaround_secure_pwd_123@postgres:5432/turnaround_360
+      
+      # Redis
+      REDIS_URL: redis://redis:6379
+      
+      # RabbitMQ
+      RABBITMQ_URL: amqp://turnaround_user:turnaround_rabbit_pwd@rabbitmq:5672/
+      
+      # JWT
+      JWT_SECRET: your_jwt_secret_key_change_this_in_production
+      JWT_EXPIRY: 24h
+      JWT_REFRESH_EXPIRY: 7d
+      
+      # Application
+      NODE_ENV: development
+      PORT: 3001
+      API_URL: http://localhost:3001
+      FRONTEND_URL: http://localhost:3000
+      
+      # Elasticsearch
+      ELASTICSEARCH_NODE: http://elasticsearch:9200
+      
+      # Email (optional - configure SendGrid later)
+      SENDGRID_API_KEY: your_sendgrid_key_optional
+      FROM_EMAIL: noreply@turnaround.com
+      
+      # Google
+      GOOGLE_CLIENT_ID: your_google_client_id_optional
+      GOOGLE_CLIENT_SECRET: your_google_secret_optional
+      GOOGLE_DRIVE_API_KEY: your_drive_api_key_optional
+      
+      # AWS S3
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: your_aws_key_optional
+      AWS_SECRET_ACCESS_KEY: your_aws_secret_optional
+      AWS_S3_BUCKET: turnaround-documents-local
+    
+    ports:
+      - '3001:3001'
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:3001/health']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    
+    networks:
+      - turnaround_network
+    
+    restart: unless-stopped
+
+  # ==========================================
+  # FRONTEND - React + TypeScript
+  # ==========================================
+  frontend:
+    image: turnaround-frontend:latest
+    container_name: turnaround_frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      VITE_API_URL: http://localhost:3001/api
+      VITE_APP_NAME: Turnaround 360
+    
+    ports:
+      - '3000:3000'
+    
+    depends_on:
+      - backend
+    
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    
+    networks:
+      - turnaround_network
+    
+    restart: unless-stopped
+
+  # ==========================================
+  # MONITORING - Prometheus
+  # ==========================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: turnaround_prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    ports:
+      - '9090:9090'
+    networks:
+      - turnaround_network
+    restart: unless-stopped
+
+  # ==========================================
+  # VISUALIZATION - Grafana
+  # ==========================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: turnaround_grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - '3009:3000'
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - turnaround_network
+    restart: unless-stopped
+
+  # ==========================================
+  # LOGS - Logstash
+  # ==========================================
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.5.0
+    container_name: turnaround_logstash
+    environment:
+      LS_JAVA_OPTS: "-Xmx256m -Xms256m"
+    volumes:
+      - ./logstash.conf:/usr/share/logstash/pipeline/logstash.conf
+    ports:
+      - '5000:5000'
+      - '9600:9600'
+    depends_on:
+      - elasticsearch
+    networks:
+      - turnaround_network
+    restart: unless-stopped
+
+# ==========================================
+# VOLUMES - Persistência de Dados
+# ==========================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+# ==========================================
+# NETWORKS - Comunicação entre Containers
+# ==========================================
+networks:
+  turnaround_network:
+    driver: bridge
